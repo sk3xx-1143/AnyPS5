@@ -5,9 +5,12 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <atomic>
+#include <chrono>
 #include <filesystem>
 #include <random>
 #include <string>
+#include <thread>
 #include <vector>
 
 #ifdef _WIN32
@@ -97,6 +100,56 @@ void DestroyedContextIsInvalid() {
     Require(sceAudioOut2ContextDestroy(context) == 0, "a live context was not destroyed");
     Require(sceAudioOut2PortDestroy(port) == errorInvalidHandle, "a port outlived its destroyed context");
     RequireInvalidContext(context);
+}
+
+void DestroyWakesBlockedPush() {
+    const auto context = CreateContext();
+    Require(sceAudioOut2ContextAdvance(context) == 0, "a live context did not advance");
+    Require(sceAudioOut2ContextPush(context, 1) == 0, "a push of the advanced grain failed");
+    std::atomic<bool> returned{false};
+    int result = 0;
+    std::thread pusher([&] {
+        result = sceAudioOut2ContextPush(context, 1);
+        returned.store(true);
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    const bool waited = !returned.load();
+    Require(sceAudioOut2ContextDestroy(context) == 0, "a context with a blocked push was not destroyed");
+    pusher.join();
+    if (waited) Require(result == errorInvalidHandle, "a push blocked across its context's destruction did not report the handle invalid");
+    RequireInvalidContext(context);
+}
+
+void DestroyDuringCallsIsSafe() {
+    std::atomic<AudioOut2ContextHandle> current{0};
+    std::atomic<bool> stop{false};
+    std::vector<std::thread> callers;
+    for (int index = 0; index < 4; ++index) {
+        callers.emplace_back([&, index] {
+            while (!stop.load()) {
+                const auto context = current.load();
+                if (context == 0) continue;
+                std::uint32_t level = 0;
+                std::uint32_t available = 0;
+                AudioOut2PortHandle port = 0;
+                switch (index) {
+                case 0: sceAudioOut2ContextPush(context, 0); break;
+                case 1: sceAudioOut2ContextGetQueueLevel(context, &level, &available); break;
+                case 2: if (CreatePort(context, &port) == 0) sceAudioOut2PortDestroy(port); break;
+                default: sceAudioOut2ContextSetAttributes(context, nullptr, 0); break;
+                }
+            }
+        });
+    }
+    for (int round = 0; round < 200; ++round) {
+        const auto context = CreateContext();
+        current.store(context);
+        std::this_thread::sleep_for(std::chrono::microseconds(200));
+        current.store(0);
+        Require(sceAudioOut2ContextDestroy(context) == 0, "a context in use on other threads was not destroyed");
+    }
+    stop.store(true);
+    for (auto& caller : callers) caller.join();
 }
 
 void UncreatedContextIsInvalid() {
@@ -299,6 +352,8 @@ int main() {
     BadGuestPointersAreRefused();
     UncreatedContextIsInvalid();
     DestroyedContextIsInvalid();
+    DestroyWakesBlockedPush();
+    DestroyDuringCallsIsSafe();
     std::filesystem::remove(path);
     std::puts("audio out2 context handles: PASS");
     return 0;

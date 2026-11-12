@@ -11,7 +11,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
-#include <unordered_set>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 #include "SceTypes.hpp"
@@ -68,12 +68,12 @@ static Clock::time_point Now(const AudioOut2Context& context) {
 }
 
 static std::mutex g_contextsLock;
-static std::unordered_set<AudioOut2Context*> g_contexts;
+static std::unordered_map<AudioOut2Context*, std::shared_ptr<AudioOut2Context>> g_contexts;
 
-AudioOut2Context* AudioOut2FindContext(AudioOut2ContextHandle ctx) {
+std::shared_ptr<AudioOut2Context> AudioOut2FindContext(AudioOut2ContextHandle ctx) {
     std::lock_guard lock(g_contextsLock);
     const auto found = g_contexts.find(reinterpret_cast<AudioOut2Context*>(ctx));
-    return found == g_contexts.end() ? nullptr : *found;
+    return found == g_contexts.end() ? nullptr : found->second;
 }
 
 void AudioOut2DestroyAllContexts() {
@@ -82,7 +82,7 @@ void AudioOut2DestroyAllContexts() {
         {
             std::lock_guard lock(g_contextsLock);
             if (g_contexts.empty()) return;
-            handle = reinterpret_cast<AudioOut2ContextHandle>(*g_contexts.begin());
+            handle = reinterpret_cast<AudioOut2ContextHandle>(g_contexts.begin()->first);
         }
         sceAudioOut2ContextDestroy(handle);
     }
@@ -312,7 +312,7 @@ static void TraceSummary(AudioOut2Context& context, Clock::time_point now) {
 static Clock::time_point WaitForRoom(AudioOut2Context& context, std::unique_lock<std::mutex>& lock) {
     auto now = Now(context);
     const auto waitStart = now;
-    while (QueueLevel(context, now) >= context.queueDepth && now - waitStart <= FULL_WAIT_TIMEOUT) {
+    while (!context.destroyed.load(std::memory_order_acquire) && QueueLevel(context, now) >= context.queueDepth && now - waitStart <= FULL_WAIT_TIMEOUT) {
         lock.unlock();
         PreciseSleepUs(std::chrono::microseconds(FULL_WAIT_STEP).count());
         lock.lock();
@@ -325,7 +325,7 @@ extern "C" {
 
 int APS5_VABI sceAudioOut2ContextAdvance(AudioOut2ContextHandle ctx) try {
     const AudioOutCall call;
-    auto* context = AudioOut2FindContext(ctx);
+    const auto context = AudioOut2FindContext(ctx);
     if (!context) return SCE_AUDIO_OUT2_ERROR_INVALID_HANDLE;
     std::unique_lock lock(context->lock);
     const QueueLevelPublisher publication{*context, lock};
@@ -344,7 +344,7 @@ int APS5_VABI sceAudioOut2ContextAdvance(AudioOut2ContextHandle ctx) try {
     }
     context->advances++;
     context->summaryAdvances++;
-    if (context->advances <= CALL_TRACE_FULL) AUDIOOUT2_TRACE("t=%.3f Advance ctx %p (pushes so far %llu)\n", AudioOut2TraceSeconds(), static_cast<void*>(context), static_cast<unsigned long long>(context->pushes));
+    if (context->advances <= CALL_TRACE_FULL) AUDIOOUT2_TRACE("t=%.3f Advance ctx %p (pushes so far %llu)\n", AudioOut2TraceSeconds(), static_cast<void*>(context.get()), static_cast<unsigned long long>(context->pushes));
     return 0;
 } catch (const ProcessShutdown&) {
     LibcAwaitExit_nid_postfix();
@@ -356,11 +356,7 @@ int APS5_VABI sceAudioOut2ContextCreate(const AudioOut2ContextParam* params, voi
     if (!GuestCopyIn_nid_no_patch(&guestParams, params, sizeof(guestParams))) return SCE_AUDIO_OUT2_ERROR_INVALID_ARGUMENT;
     if (guestParams.num_grains > MAX_GRAIN) return SCE_AUDIO_OUT2_ERROR_INVALID_ARGUMENT;
     const float padSpeakerFallbackGain = AudioPadSpeakerFallbackGain();
-    const auto destroyUnpublished = [](AudioOut2Context* unpublished) {
-        CloseDevice(unpublished->device);
-        delete unpublished;
-    };
-    std::unique_ptr<AudioOut2Context, decltype(destroyUnpublished)> context(new AudioOut2Context(), destroyUnpublished);
+    auto context = std::make_shared<AudioOut2Context>();
     context->padSpeakerFallbackGain = padSpeakerFallbackGain;
     context->grain = guestParams.num_grains ? guestParams.num_grains : AUDIO_OUT2_DEFAULT_GRAIN;
     context->queueDepth = guestParams.queue_depth ? guestParams.queue_depth : 1;
@@ -371,44 +367,49 @@ int APS5_VABI sceAudioOut2ContextCreate(const AudioOut2ContextParam* params, voi
         static_cast<void*>(context.get()), context->grain, 1000.0 * context->grain / AUDIO_OUT2_SAMPLE_RATE, context->queueDepth, AUDIO_OUT2_SAMPLE_RATE);
     OpenDevice(*context);
     context->deviceBacked = context->device != 0;
-    {
+    try {
         std::lock_guard lock(g_contextsLock);
-        g_contexts.insert(context.get());
+        g_contexts.emplace(context.get(), context);
+    } catch (...) {
+        CloseDevice(std::exchange(context->device, 0));
+        throw;
     }
     auto handle = reinterpret_cast<AudioOut2ContextHandle>(context.get());
     if (!GuestCopyOut_nid_no_patch(ctx, &handle, sizeof(handle))) {
-        std::lock_guard lock(g_contextsLock);
-        g_contexts.erase(context.get());
+        sceAudioOut2ContextDestroy(handle);
         return SCE_AUDIO_OUT2_ERROR_INVALID_ARGUMENT;
     }
-    context.release();
     return 0;
 }
 
 int APS5_VABI sceAudioOut2ContextDestroy(AudioOut2ContextHandle ctx) try {
     const AudioOutCall call;
-    auto* context = reinterpret_cast<AudioOut2Context*>(ctx);
+    std::shared_ptr<AudioOut2Context> context;
     {
         std::lock_guard lock(g_contextsLock);
-        if (g_contexts.erase(context) == 0) return SCE_AUDIO_OUT2_ERROR_INVALID_HANDLE;
+        const auto found = g_contexts.find(reinterpret_cast<AudioOut2Context*>(ctx));
+        if (found == g_contexts.end()) return SCE_AUDIO_OUT2_ERROR_INVALID_HANDLE;
+        context = std::move(found->second);
+        g_contexts.erase(found);
     }
-    AUDIOOUT2_TRACE("t=%.3f ContextDestroy ctx %p after %llu pushes\n", AudioOut2TraceSeconds(), static_cast<void*>(context), static_cast<unsigned long long>(context->pushes));
+    AUDIOOUT2_TRACE("t=%.3f ContextDestroy ctx %p after %llu pushes\n", AudioOut2TraceSeconds(), static_cast<void*>(context.get()), static_cast<unsigned long long>(context->pushes));
     SDL_AudioDeviceID device = 0;
     {
         std::lock_guard lock(context->lock);
+        context->destroyed.store(true, std::memory_order_release);
         device = std::exchange(context->device, 0);
         ClosePadDevice(*context);
     }
+    context->grainReady.notify_all();
     CloseDevice(device);
     AudioOut2ReleasePorts(*context);
-    delete context;
     return 0;
 } catch (const ProcessShutdown&) {
     LibcAwaitExit_nid_postfix();
 }
 
 int APS5_VABI sceAudioOut2ContextGetQueueLevel(AudioOut2ContextHandle ctx, uint32_t* queue_level, uint32_t* available_queue) {
-    auto* context = AudioOut2FindContext(ctx);
+    const auto context = AudioOut2FindContext(ctx);
     if (!context) return SCE_AUDIO_OUT2_ERROR_INVALID_HANDLE;
     if (context->deviceBacked && !AudioOut2TraceEnabled()) {
         const auto level = context->publishedQueueLevel.load(std::memory_order_acquire);
@@ -422,26 +423,28 @@ int APS5_VABI sceAudioOut2ContextGetQueueLevel(AudioOut2ContextHandle ctx, uint3
     if (available_queue) *available_queue = context->queueDepth - level;
     context->queueLevelPolls++;
     context->summaryPolls++;
-    if (context->queueLevelPolls <= CALL_TRACE_FULL) AUDIOOUT2_TRACE("t=%.3f GetQueueLevel ctx %p -> level %u, available %u\n", AudioOut2TraceSeconds(), static_cast<void*>(context), level, context->queueDepth - level);
+    if (context->queueLevelPolls <= CALL_TRACE_FULL) AUDIOOUT2_TRACE("t=%.3f GetQueueLevel ctx %p -> level %u, available %u\n", AudioOut2TraceSeconds(), static_cast<void*>(context.get()), level, context->queueDepth - level);
     return 0;
 }
 
 int APS5_VABI sceAudioOut2ContextPush(AudioOut2ContextHandle ctx, uint32_t blocking) try {
     const AudioOutCall call;
-    auto* context = AudioOut2FindContext(ctx);
+    const auto context = AudioOut2FindContext(ctx);
     if (!context) return SCE_AUDIO_OUT2_ERROR_INVALID_HANDLE;
     std::unique_lock lock(context->lock);
     const QueueLevelPublisher publication{*context, lock};
     auto now = Now(*context);
     if (!blocking && QueueLevel(*context, now) >= context->queueDepth) {
         context->fullRejects++;
-        if (context->fullRejects <= CALL_TRACE_FULL) AUDIOOUT2_TRACE("t=%.3f Push ctx %p non-blocking on a full queue (%u): rejected\n", AudioOut2TraceSeconds(), static_cast<void*>(context), context->queueDepth);
+        if (context->fullRejects <= CALL_TRACE_FULL) AUDIOOUT2_TRACE("t=%.3f Push ctx %p non-blocking on a full queue (%u): rejected\n", AudioOut2TraceSeconds(), static_cast<void*>(context.get()), context->queueDepth);
         return SCE_AUDIO_OUT2_ERROR_QUEUE_FULL;
     }
     if (blocking) now = WaitForRoom(*context, lock);
+    if (context->destroyed.load(std::memory_order_acquire)) return SCE_AUDIO_OUT2_ERROR_INVALID_HANDLE;
     if (context->advancedMode && context->advancedGrains.empty()) {
         if (!blocking) throw std::runtime_error("AudioOut2: a non-blocking push without a rendered grain is not implemented");
-        if (!context->grainReady.wait(lock, LibcShutdownToken_nid_postfix(), [&] { return !context->advancedGrains.empty(); })) throw ProcessShutdown{};
+        if (!context->grainReady.wait(lock, LibcShutdownToken_nid_postfix(), [&] { return !context->advancedGrains.empty() || context->destroyed.load(std::memory_order_acquire); })) throw ProcessShutdown{};
+        if (context->destroyed.load(std::memory_order_acquire)) return SCE_AUDIO_OUT2_ERROR_INVALID_HANDLE;
         now = Now(*context);
         Drain(*context, now);
     }
@@ -484,7 +487,7 @@ int APS5_VABI sceAudioOut2ContextPush(AudioOut2ContextHandle ctx, uint32_t block
     context->summaryPushes++;
     if (blocking) context->blockingPushes++;
     if (context->pushes <= CALL_TRACE_FULL) {
-        AUDIOOUT2_TRACE("t=%.3f Push ctx %p blocking=%u: grain from %u ports, hw queue %u/%u, unread %u ms\n", AudioOut2TraceSeconds(), static_cast<void*>(context), blocking,
+        AUDIOOUT2_TRACE("t=%.3f Push ctx %p blocking=%u: grain from %u ports, hw queue %u/%u, unread %u ms\n", AudioOut2TraceSeconds(), static_cast<void*>(context.get()), blocking,
             mixed, QueueLevel(*context, now), context->queueDepth, PendingMs(*context));
     }
     TraceSummary(*context, now);
@@ -516,11 +519,11 @@ int APS5_VABI sceAudioOut2ContextResetParam(AudioOut2ContextParam* params) {
 }
 
 int APS5_VABI sceAudioOut2ContextSetAttributes(AudioOut2ContextHandle ctx, const AudioOut2Attribute* attributes, uint32_t num) {
-    auto* context = AudioOut2FindContext(ctx);
+    const auto context = AudioOut2FindContext(ctx);
     if (!context) return SCE_AUDIO_OUT2_ERROR_INVALID_HANDLE;
     if (!attributes && num != 0) return SCE_AUDIO_OUT2_ERROR_INVALID_ARGUMENT;
     for (uint32_t index = 0; index < num; index++) {
-        AUDIOOUT2_TRACE("t=%.3f ContextSetAttributes ctx %p: id=0x%x size=%zu value=%p (ignored)\n", AudioOut2TraceSeconds(), static_cast<void*>(context), attributes[index].attribute_id, attributes[index].value_size, attributes[index].value);
+        AUDIOOUT2_TRACE("t=%.3f ContextSetAttributes ctx %p: id=0x%x size=%zu value=%p (ignored)\n", AudioOut2TraceSeconds(), static_cast<void*>(context.get()), attributes[index].attribute_id, attributes[index].value_size, attributes[index].value);
     }
     return 0;
 }

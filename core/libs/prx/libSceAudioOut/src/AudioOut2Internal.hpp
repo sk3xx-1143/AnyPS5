@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <deque>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <stop_token>
@@ -132,11 +133,12 @@ struct AudioOut2Context {
     float summaryPeak = 0.0f;
     std::chrono::steady_clock::time_point summaryStart;
     bool deviceBacked = false;
+    std::atomic<bool> destroyed{false};
     std::atomic<std::uint32_t> publishedQueueLevel{0};
     std::optional<std::chrono::steady_clock::time_point> clockForTest;
 };
 
-AudioOut2Context* AudioOut2FindContext(AudioOut2ContextHandle ctx);
+std::shared_ptr<AudioOut2Context> AudioOut2FindContext(AudioOut2ContextHandle ctx);
 void AudioOut2DestroyAllContexts();
 
 // Mixes every port of the context that carries PCM data into out (stereo float, frames frames), summing
